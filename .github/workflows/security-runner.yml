@@ -1,0 +1,179 @@
+name: Sandbox runner security
+"on":
+  workflow_dispatch:
+    inputs:
+      check:
+        description: Synthetic security scenario
+        type: choice
+        options: [isolation, writer, ferry]
+        required: true
+permissions:
+  contents: read
+jobs:
+  ordinary:
+    if: inputs.check == 'isolation'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm writer secret is unavailable
+        env:
+          WRITER_KEY: ${{ secrets.SANDBOX_APP_PRIVATE_KEY }}
+        run: test -z "$WRITER_KEY"
+  writer:
+    if: inputs.check == 'writer'
+    runs-on: ubuntu-latest
+    environment: sandbox-staging-writer
+    steps:
+      - name: Verify App scope and test sandbox refs
+        env:
+          WRITER_KEY: ${{ secrets.SANDBOX_APP_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set +x
+          python3 - <<'PY'
+          import base64, json, os, subprocess, tempfile, time, urllib.error, urllib.request
+          from pathlib import Path
+
+          repo = "hkwayapp/HKWay-V3-Security-Sandbox"
+          if (os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_REF")) != (repo, "refs/heads/main"):
+              raise SystemExit("Unexpected repository or ref reached protected execution.")
+
+          def api(path, token, method="GET", body=None):
+              req = urllib.request.Request("https://api.github.com" + path, method=method,
+                  headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+                  data=json.dumps(body).encode() if body is not None else None)
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      raw = response.read()
+                      return json.loads(raw) if raw else None
+              except urllib.error.HTTPError as error:
+                  raise SystemExit(f"GitHub API returned HTTP {error.code}.") from None
+
+          def b64(data):
+              return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+          key = os.environ.pop("WRITER_KEY", "")
+          if not key:
+              raise SystemExit("Approved writer did not receive its environment secret.")
+          now = int(time.time())
+          msg = b64(b'{"alg":"RS256","typ":"JWT"}') + b"." + b64(json.dumps(
+              {"iat":now-60,"exp":now+500,"iss":"5946121"}).encode())
+          fd = os.memfd_create("sandbox-signing-key", os.MFD_CLOEXEC)
+          try:
+              with os.fdopen(os.dup(fd), "wb") as f:
+                  f.write(key.encode())
+              del key
+              os.lseek(fd, 0, os.SEEK_SET)
+              sig = subprocess.run(["openssl","dgst","-sha256","-sign",f"/proc/self/fd/{fd}"],
+                  input=msg, pass_fds=(fd,), capture_output=True, check=True).stdout
+          finally:
+              os.close(fd)
+          jwt = (msg + b"." + b64(sig)).decode()
+          identity = api("/app", jwt)
+          if (identity["id"], identity["slug"]) != (5946121, "hkway-v3-sandbox-writer"):
+              raise SystemExit("Unexpected App identity.")
+          installation = api("/repos/" + repo + "/installation", jwt)
+          if (installation["id"], installation["repository_selection"], installation["permissions"]) != (
+              186340724, "selected", {"contents":"write","metadata":"read"}
+          ):
+              raise SystemExit("Unexpected installation permissions.")
+          installs = api("/app/installations?per_page=100", jwt)
+          if [x["id"] for x in installs] != [186340724]:
+              raise SystemExit("Unexpected App installation scope.")
+          issued = api("/app/installations/186340724/access_tokens", jwt, "POST",
+              {"repository_ids":[int(os.environ["GITHUB_REPOSITORY_ID"])],"permissions":{"contents":"write"}})
+          token = issued["token"]
+          del jwt
+          try:
+              repos = api("/installation/repositories", token)
+              if repos["total_count"] != 1 or [x["full_name"] for x in repos["repositories"]] != [repo]:
+                  raise SystemExit("Token is not confined to the sandbox.")
+              url = "https://github.com/" + repo + ".git"
+              stage = "refs/heads/dataset-v3-staging"
+              with tempfile.TemporaryDirectory() as tmp:
+                  def git(*args, authenticated=False):
+                      env = {k:v for k,v in os.environ.items() if not k.startswith("GIT_TRACE") and k != "GIT_CURL_VERBOSE"}
+                      env["GIT_TERMINAL_PROMPT"] = "0"
+                      env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="credential.helper", GIT_CONFIG_VALUE_0="")
+                      if authenticated:
+                          env.update(GIT_CONFIG_COUNT="2",GIT_CONFIG_KEY_1="http.https://github.com/.extraHeader",
+                              GIT_CONFIG_VALUE_1="Authorization: Basic "+base64.b64encode(("x-access-token:"+token).encode()).decode())
+                      return subprocess.run(["git","-c","maintenance.auto=false","-C",tmp,*args],env=env,
+                          capture_output=True,text=True,timeout=45)
+                  def local(*args):
+                      result=git(*args)
+                      if result.returncode: raise SystemExit("Synthetic Git setup failed.")
+                      return result.stdout.strip()
+                  local("init","-q")
+                  local("fetch","--no-tags",url,stage)
+                  local("switch","--detach","FETCH_HEAD")
+                  before=local("rev-parse","HEAD")
+                  (Path(tmp)/"state").mkdir(exist_ok=True)
+                  (Path(tmp)/"state"/"runner-synthetic.txt").write_text(os.environ["GITHUB_RUN_ID"]+"\n")
+                  local("add","--","state/runner-synthetic.txt")
+                  local("-c","user.name=Sandbox Test","-c","user.email=sandbox@example.invalid","commit","-qm","Synthetic writer check")
+                  after=local("rev-parse","HEAD")
+                  if git("push",url,"HEAD:"+stage,authenticated=True).returncode:
+                      raise SystemExit("Authorized staging push failed.")
+                  print(f"staging {before} -> {after}")
+                  local("fetch","--no-tags",url,"refs/heads/main")
+                  local("switch","--detach","FETCH_HEAD")
+                  (Path(tmp)/"state").mkdir(exist_ok=True)
+                  (Path(tmp)/"state"/"runner-denied-main.txt").write_text("synthetic negative test\n")
+                  local("add","--","state/runner-denied-main.txt")
+                  local("-c","user.name=Sandbox Test","-c","user.email=sandbox@example.invalid","commit","-qm","Synthetic denied main check")
+                  denied=git("push",url,"HEAD:refs/heads/main",authenticated=True)
+                  if denied.returncode == 0:
+                      raise SystemExit("Unexpected main push acceptance; stop and roll back the sandbox.")
+                  if "GH013" not in denied.stderr and "repository rule violations" not in denied.stderr.lower():
+                      raise SystemExit("Main push rejection could not be attributed to rulesets.")
+                  print("Main push denied by repository rules.")
+          finally:
+              api("/installation/token", token, "DELETE")
+              print("Temporary installation token revoked.")
+          PY
+  ferry:
+    if: inputs.check == 'ferry'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Test synthetic Ferry write through GITHUB_TOKEN
+        env:
+          SANDBOX_JOB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set +x
+          python3 - <<'PY'
+          import base64, os, subprocess, tempfile
+          from pathlib import Path
+
+          if (os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF"]) != (
+              "hkwayapp/HKWay-V3-Security-Sandbox", "refs/heads/main"
+          ):
+              raise SystemExit("Unexpected repository or ref.")
+          token = os.environ.pop("SANDBOX_JOB_TOKEN")
+          with tempfile.TemporaryDirectory() as tmp:
+              url = "https://github.com/hkwayapp/HKWay-V3-Security-Sandbox.git"
+              env = {k:v for k,v in os.environ.items() if not k.startswith("GIT_TRACE") and k != "GIT_CURL_VERBOSE"}
+              env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="credential.helper",
+                  GIT_CONFIG_VALUE_0="", GIT_CONFIG_KEY_1="http.https://github.com/.extraHeader",
+                  GIT_CONFIG_VALUE_1="Authorization: Basic "+base64.b64encode(("x-access-token:"+token).encode()).decode())
+              def git(*args):
+                  return subprocess.run(["git","-C",tmp,*args], env=env, capture_output=True, text=True, timeout=45)
+              def local(*args):
+                  if git(*args).returncode: raise SystemExit("Synthetic Ferry fixture setup failed.")
+              local("init","-q")
+              local("fetch","--no-tags",url,"refs/heads/main")
+              local("switch","--detach","FETCH_HEAD")
+              ferry = Path(tmp)/"FerryDataset"
+              ferry.mkdir()
+              (ferry/"synthetic.json").write_text('{"fixture":true}\n')
+              local("add","--","FerryDataset/synthetic.json")
+              local("-c","user.name=Sandbox Test","-c","user.email=sandbox@example.invalid","commit","-qm","Synthetic Ferry check")
+              result=git("push",url,"HEAD:refs/heads/main")
+              if result.returncode == 0:
+                  raise SystemExit("Unexpected Ferry push acceptance; stop and roll back the sandbox.")
+              if "GH013" not in result.stderr and "repository rule violations" not in result.stderr.lower():
+                  raise SystemExit("Ferry rejection could not be attributed to rulesets.")
+              print("Legacy Ferry token pattern blocked by main ruleset; writer compatibility unresolved.")
+          PY
