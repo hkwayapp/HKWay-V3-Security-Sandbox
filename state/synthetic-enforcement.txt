@@ -1,1 +1,1 @@
-Synthetic authorized staging ref test
+Synthetic competing writer B
